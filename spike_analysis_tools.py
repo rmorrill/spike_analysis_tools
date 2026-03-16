@@ -89,6 +89,11 @@ def return_spike_array(spike_train, trig_times, time_win, trial_filt=None):
     spike_train = np.array(spike_train)
 
     if trial_filt is not None: 
+        if len(trial_filt) != len(trig_times): 
+            print('WARNING: trial_filt length does not match trig_times length')
+            print(f'trial_filt length: {len(trial_filt)}; trig_times length: {len(trig_times)}')
+            print('truncating trial_filt to match trig_times length')
+            trial_filt = trial_filt[:len(trig_times)]
         trig_times = trig_times[trial_filt]
 
     n_trs = len(trig_times)
@@ -107,6 +112,22 @@ def return_spike_array(spike_train, trig_times, time_win, trial_filt=None):
         
 
 def return_PSTH(spike_array, t1, t2, binwidth):
+    """
+    Calculate PSTH from spike array
+
+    Parameters:
+    spike_array (list of numpy ndarrays)
+    t1 (float)
+    t2 (float)
+    binwidth (float)
+
+    Returns:
+    psth_mu (numpy array)
+    psth_std (numpy array)
+    psth_sem (numpy array)
+    time (numpy array)
+    
+    """
     n_trs = len(spike_array) 
     psth_bins = np.arange(t1, t2 + binwidth, binwidth)
     
@@ -222,7 +243,8 @@ def read_mat(matfile_full, struct, field=None):
             #print(key)
             val = process_mat_data(vals[key])
             exec(key + '=val')
-            exec(f"struct_dict['{key}'] = {key}")
+            struct_dict[key] = val
+            #exec(f"struct_dict['{key}'] = {key}")
         
         return struct_dict
     elif field in keys:
@@ -252,7 +274,9 @@ def process_mat_data(data_in):
                 nonempty_idx = first_nonempty(data_out)
                 if nonempty_idx is None: 
                     nonempty_idx = 0
-                if type(data_out[nonempty_idx][0]) is np.str_: 
+                if data_out[nonempty_idx].size == 0:
+                    data_out = []
+                elif type(data_out[nonempty_idx][0]) is np.str_: 
                     data_out = [str(d[0]) for d in data_out]
     else: 
         data_out = []
@@ -446,7 +470,8 @@ def get_experiment_trigger_dict(data_path, behavior_timestamp):
     trig_keys = list(triggers.keys())
     behavior_files = [x['behav_file_name'] for x in triggers.values()]
 
-    trigidx = [i for i, s in enumerate(behavior_files) if behavior_timestamp in s][0]
+    #trigidx = [i for i, s in enumerate(behavior_files) if behavior_timestamp in s][0]
+    trigidx = [i for i, s in enumerate(behavior_files) if s is not None and behavior_timestamp.strip() in s][0]
     expt_triggers = triggers[trig_keys[trigidx]]
     return expt_triggers
 
@@ -603,7 +628,7 @@ def get_behavior_npzs(data_path):
 
 def return_behav_file(data_path, behavior_timestamp): 
     behav_flist = get_behavior_npzs(data_path)
-    behavior_file = [s for i, s in enumerate(behav_flist) if behavior_timestamp in str(s)]
+    behavior_file = [s for i, s in enumerate(behav_flist) if behavior_timestamp.strip() in str(s)]
     return behavior_file[0]
 
 
@@ -777,6 +802,7 @@ def plot_waveforms(wfs, col='green', meancol='blue', n_plot=None, alpha=0.1, plo
     if plot_mean: 
         plt.plot(np.median(wfs, axis= 1), color=meancol, linestyle='--', label='median WF')
     plt.autoscale(enable=True, tight=True)
+    plt.grid(False)
     box_off(plt.gca())
 
 
@@ -852,24 +878,392 @@ def filter_clusts_fr(clustlist, spikesort_path, start_end_t = None, min_FR=0.1):
     fr_curr = np.zeros(len(clustlist))
     for ii, clust in enumerate(clustlist):
         st_curr = st[sc==clust]
-        fr_curr[ii] = int(np.sum((st_curr>=expt_start) & (st_curr<expt_end)))/(expt_end-expt_start)
+        fr_curr[ii] = np.sum((st_curr>=expt_start) & (st_curr<expt_end))/(expt_end-expt_start)
     
     clustlist_filt = clustlist[fr_curr>=min_FR]
     frs_filt = fr_curr[fr_curr>=min_FR]
 
     return clustlist_filt, frs_filt
 
-def waveform_peak_trough_time(waveform, sampling_rate_khz=30): 
+def waveform_peak_trough_time(waveform, sampling_rate_khz=30):
     # Find peak (largest absolute amplitude)
     peak_idx = np.argmax(np.abs(waveform))
-    
+
     # Define search window after peak to find trough
     if waveform[peak_idx] > 0:
         trough_idx = peak_idx + np.argmin(waveform[peak_idx:])
     else:
         trough_idx = peak_idx + np.argmax(waveform[peak_idx:])
-    
+
     # Calculate time difference (in samples) and convert to ms
     peak_trough_samples = trough_idx - peak_idx
     peak_trough_time_ms = peak_trough_samples / sampling_rate_khz
     return peak_trough_time_ms, peak_idx, trough_idx
+
+
+# ================================================================================
+# Active Period Detection Functions
+# ================================================================================
+
+def detect_active_periods(spike_train, total_duration, bin_size=60, step_size=30,
+                         threshold_percentile=20, min_consecutive_bins=2,
+                         max_gap_to_merge=120, use_high_percentile=True,
+                         high_percentile=75):
+    """
+    Detect active and inactive periods for a single unit based on firing rate.
+
+    Uses a sliding window approach with a forgiving threshold to identify
+    periods when the unit stops firing or has very low activity. Includes
+    gap merging to handle occasional blips during dropout periods, and uses
+    a high percentile for threshold calculation to handle units with brief
+    high-activity periods.
+
+    Parameters
+    ----------
+    spike_train : np.ndarray
+        Array of spike times in seconds
+    total_duration : float
+        Total recording duration in seconds
+    bin_size : float, optional
+        Size of sliding window in seconds (default: 60)
+    step_size : float, optional
+        Step size for sliding window in seconds (default: 30)
+    threshold_percentile : float, optional
+        Percentage of baseline firing rate below which a bin is considered
+        inactive (default: 20, meaning 20% of baseline)
+    min_consecutive_bins : int, optional
+        Minimum number of consecutive low-FR bins to mark as inactive
+        (default: 2, for sustained dropouts)
+    max_gap_to_merge : float, optional
+        Maximum gap (in seconds) between inactive periods to merge them.
+        Helps eliminate striping from occasional blips during dropouts.
+        (default: 120 seconds)
+    use_high_percentile : bool, optional
+        If True, use high_percentile of firing rates as baseline instead of
+        median. This helps detect dropouts in units with brief high-activity
+        periods. (default: True)
+    high_percentile : float, optional
+        Percentile to use as baseline when use_high_percentile=True
+        (default: 75, meaning 75th percentile)
+
+    Returns
+    -------
+    inactive_periods : list of tuple
+        List of (start_time, end_time) tuples marking inactive periods
+
+    Examples
+    --------
+    >>> inactive = detect_active_periods(spike_times, 3600, bin_size=60, step_size=30)
+    >>> print(f"Unit was inactive during {len(inactive)} periods")
+
+    >>> # For units with very brief high-activity periods
+    >>> inactive = detect_active_periods(spike_times, 3600, use_high_percentile=True, high_percentile=90)
+    """
+    if len(spike_train) == 0:
+        # No spikes at all - entire recording is inactive
+        return [(0, total_duration)]
+
+    # Create sliding windows
+    bin_starts = np.arange(0, total_duration - bin_size + step_size, step_size)
+    bin_ends = bin_starts + bin_size
+
+    # Calculate firing rate in each bin
+    firing_rates = np.zeros(len(bin_starts))
+    for i, (start, end) in enumerate(zip(bin_starts, bin_ends)):
+        n_spikes = np.sum((spike_train >= start) & (spike_train < end))
+        firing_rates[i] = n_spikes / bin_size
+
+    # Compute threshold using more robust baseline
+    if use_high_percentile:
+        # Use high percentile to avoid low overall median for brief high-FR units
+        baseline_fr = np.percentile(firing_rates, high_percentile)
+    else:
+        baseline_fr = np.median(firing_rates)
+
+    threshold = (threshold_percentile / 100.0) * baseline_fr
+
+    # Identify low-FR bins
+    low_fr_bins = firing_rates < threshold
+
+    # Find consecutive stretches of low-FR bins
+    inactive_periods = []
+    in_inactive = False
+    inactive_start = None
+    consecutive_count = 0
+
+    for i, is_low in enumerate(low_fr_bins):
+        if is_low:
+            if not in_inactive:
+                inactive_start = bin_starts[i]
+                consecutive_count = 1
+                in_inactive = True
+            else:
+                consecutive_count += 1
+        else:
+            if in_inactive:
+                # End of inactive period - only add if long enough
+                if consecutive_count >= min_consecutive_bins:
+                    inactive_end = bin_starts[i-1] + bin_size
+                    inactive_periods.append((inactive_start, inactive_end))
+                in_inactive = False
+                consecutive_count = 0
+
+    # Handle case where recording ends during inactive period
+    if in_inactive and consecutive_count >= min_consecutive_bins:
+        inactive_periods.append((inactive_start, total_duration))
+
+    # Merge inactive periods separated by short gaps (eliminates striping)
+    if len(inactive_periods) > 1 and max_gap_to_merge > 0:
+        merged_periods = []
+        current_start, current_end = inactive_periods[0]
+
+        for next_start, next_end in inactive_periods[1:]:
+            gap = next_start - current_end
+            if gap <= max_gap_to_merge:
+                # Merge: extend current period to include the gap and next period
+                current_end = next_end
+            else:
+                # Gap too large: save current period and start new one
+                merged_periods.append((current_start, current_end))
+                current_start, current_end = next_start, next_end
+
+        # Add the last period
+        merged_periods.append((current_start, current_end))
+        inactive_periods = merged_periods
+
+    return inactive_periods
+
+
+def load_active_periods(spikesort_path, cluster_id):
+    """
+    Load pre-computed inactive period data for a specific cluster.
+
+    Parameters
+    ----------
+    spikesort_path : str or Path
+        Path to Kilosort output directory
+    cluster_id : int
+        Cluster ID to retrieve
+
+    Returns
+    -------
+    inactive_periods : list of tuple or None
+        List of (start_time, end_time) tuples for inactive periods,
+        or None if file doesn't exist or cluster not found
+
+    Examples
+    --------
+    >>> inactive = load_active_periods(spikesort_path, 42)
+    >>> if inactive:
+    ...     print(f"Cluster 42 has {len(inactive)} inactive periods")
+    """
+    import pandas as pd
+
+    spikesort_path = Path(spikesort_path)
+    active_periods_file = spikesort_path / 'active_periods.pkl'
+
+    if not active_periods_file.exists():
+        return None
+
+    try:
+        df = pd.read_pickle(active_periods_file)
+        matching = df[df['cluster_id'] == cluster_id]
+
+        if len(matching) == 0:
+            return None
+
+        inactive_periods = matching.iloc[0]['inactive_periods']
+        return inactive_periods if len(inactive_periods) > 0 else None
+
+    except Exception as e:
+        print(f"Warning: Could not load active periods: {e}")
+        return None
+
+
+def plot_inactive_bands_continuous(ax, inactive_periods, color='red', alpha=0.3):
+    """
+    Overlay inactive period bands on a continuous-time plot.
+
+    For plots where time is on the X-axis (e.g., activity histogram over session).
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes object to plot on
+    inactive_periods : list of tuple
+        List of (start_time, end_time) tuples marking inactive periods
+    color : str, optional
+        Color for the bands (default: 'red')
+    alpha : float, optional
+        Transparency level (default: 0.3)
+
+    Returns
+    -------
+    patches : list
+        List of matplotlib patch objects added to the axes
+
+    Examples
+    --------
+    >>> fig, ax = plt.subplots()
+    >>> plot_unit_over_session(spike_train, spikesort_path)
+    >>> inactive = [(100, 200), (500, 600)]
+    >>> plot_inactive_bands_continuous(ax, inactive)
+    """
+    patches = []
+    for start, end in inactive_periods:
+        patch = ax.axvspan(start, end, facecolor=color, alpha=alpha, zorder=2)
+        patches.append(patch)
+    return patches
+
+
+def get_inactive_trials(inactive_periods, trial_times):
+    """
+    Determine which trials occurred during inactive periods.
+
+    Parameters
+    ----------
+    inactive_periods : list of tuple
+        List of (start_time, end_time) tuples marking inactive periods
+    trial_times : np.ndarray
+        Array of trial trigger times in seconds
+
+    Returns
+    -------
+    inactive_trials : np.ndarray
+        Boolean array (length = n_trials) where True indicates the trial
+        occurred during an inactive period
+
+    Examples
+    --------
+    >>> inactive_periods = [(100, 200), (500, 600)]
+    >>> trial_times = np.array([50, 150, 250, 550, 700])
+    >>> inactive = get_inactive_trials(inactive_periods, trial_times)
+    >>> # Returns: [False, True, False, True, False]
+    """
+    if inactive_periods is None or len(inactive_periods) == 0:
+        return np.zeros(len(trial_times), dtype=bool)
+
+    inactive_trials = np.zeros(len(trial_times), dtype=bool)
+
+    for start, end in inactive_periods:
+        # Mark trials whose trigger time falls within this inactive period
+        in_period = (trial_times >= start) & (trial_times < end)
+        inactive_trials |= in_period
+
+    return inactive_trials
+
+
+def plot_inactive_bands_raster(ax, inactive_trial_indices, color='red', alpha=0.3):
+    """
+    Overlay inactive trial bands on a trial-based raster plot.
+
+    For raster plots where trials are on the Y-axis. Draws horizontal bands
+    across specific trial rows.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes object to plot on
+    inactive_trial_indices : np.ndarray or list
+        Indices of trials (0-based) that should be marked as inactive
+    color : str, optional
+        Color for the bands (default: 'red')
+    alpha : float, optional
+        Transparency level (default: 0.3)
+
+    Returns
+    -------
+    patches : list
+        List of matplotlib patch objects added to the axes
+
+    Examples
+    --------
+    >>> fig, ax = plt.subplots()
+    >>> plot_raster(spike_array, -0.2, 0.5, ax=ax)
+    >>> inactive_indices = [5, 6, 12, 13, 14]  # trials 5, 6, 12-14 are inactive
+    >>> plot_inactive_bands_raster(ax, inactive_indices)
+    """
+    patches = []
+
+    # Convert to array if needed
+    if isinstance(inactive_trial_indices, (list, np.ndarray)):
+        inactive_trial_indices = np.array(inactive_trial_indices)
+
+    # If it's a boolean array, convert to indices
+    if inactive_trial_indices.dtype == bool:
+        inactive_trial_indices = np.where(inactive_trial_indices)[0]
+
+    for trial_idx in inactive_trial_indices:
+        # Draw horizontal band for this trial
+        # Y-coordinates in raster are typically 0-indexed trial numbers
+        patch = ax.axhspan(trial_idx, trial_idx + 1,
+                          facecolor=color, alpha=alpha, zorder=1)
+        patches.append(patch)
+
+    return patches
+
+
+def return_PSTH_with_active_filter(spike_array, trial_active_filter, t1, t2, binwidth):
+    """
+    Calculate PSTH from spike array, excluding inactive trials.
+
+    Modified version of return_PSTH that only includes trials marked as active.
+    This prevents dropout periods from artificially lowering the mean firing rate.
+
+    Parameters
+    ----------
+    spike_array : list of np.ndarray
+        Output of return_spike_array - list of spike time arrays per trial
+    trial_active_filter : np.ndarray
+        Boolean array (length = n_trials) where True indicates an active trial
+    t1 : float
+        Start of PSTH window (seconds relative to trigger)
+    t2 : float
+        End of PSTH window
+    binwidth : float
+        Bin width in seconds (e.g., 0.01 for 10 ms bins)
+
+    Returns
+    -------
+    psth_mu : np.ndarray
+        Mean firing rate per bin (Hz), computed only from active trials
+    psth_std : np.ndarray
+        Standard deviation across active trials
+    psth_sem : np.ndarray
+        Standard error of the mean (uses n_active_trials)
+    time : np.ndarray
+        Bin center times
+
+    Examples
+    --------
+    >>> # Get spike array and determine active trials
+    >>> spike_array = return_spike_array(st, triggers, [-0.2, 0.5])
+    >>> active = ~get_inactive_trials(inactive_periods, triggers)
+    >>> mu, std, sem, t = return_PSTH_with_active_filter(spike_array, active,
+    ...                                                   -0.2, 0.5, 0.01)
+    """
+    # Filter spike array to only include active trials
+    active_spikes = [spike_array[i] for i in range(len(spike_array))
+                     if trial_active_filter[i]]
+
+    n_active_trs = len(active_spikes)
+
+    if n_active_trs == 0:
+        # No active trials - return zeros
+        psth_bins = np.arange(t1, t2 + binwidth, binwidth)
+        n_bins = len(psth_bins) - 1
+        return (np.zeros(n_bins), np.zeros(n_bins),
+                np.zeros(n_bins), np.diff(psth_bins)/2 + psth_bins[:-1])
+
+    # Compute PSTH using only active trials
+    psth_bins = np.arange(t1, t2 + binwidth, binwidth)
+    spike_hist_all = np.array([np.histogram(spikes_trial, psth_bins)[0]
+                               for spikes_trial in active_spikes])
+    spike_hist_all = spike_hist_all / binwidth
+
+    psth_mu = np.mean(spike_hist_all, axis=0)
+    psth_std = np.std(spike_hist_all, axis=0)
+    psth_sem = psth_std / np.sqrt(n_active_trs)
+    time = np.diff(psth_bins) / 2 + psth_bins[:-1]
+
+    return psth_mu, psth_std, psth_sem, time
